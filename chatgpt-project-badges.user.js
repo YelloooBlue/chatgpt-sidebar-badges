@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Project Badges (Pro)
 // @namespace    chatgpt-project-badges
-// @version      2.4.1
-// @description  Show Project badges with native icons & colors in ChatGPT Recent sidebar (with cache, scoped observer & 429 backoff)
+// @version      2.5.0
+// @description  Show clickable Project badges with native icons & colors in ChatGPT Recent sidebar (with cache, scoped observer & 429 backoff)
 // @license      MIT
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -124,7 +124,12 @@
       line-height: 16px;
       white-space: nowrap;
       vertical-align: middle;
-      pointer-events: none;
+      pointer-events: auto;
+      cursor: pointer;
+      transition: filter 0.15s ease, background-color 0.15s ease;
+    }
+    .cgpt-project-badge:hover {
+      filter: brightness(1.15);
     }
     .cgpt-project-badge-icon {
       display: inline-flex;
@@ -603,12 +608,13 @@
       if (!badge) {
         badge = document.createElement('span');
         badge.className = 'cgpt-project-badge';
-        badge.setAttribute('aria-hidden', 'true');
+        badge.setAttribute('role', 'button');
         item.link.appendChild(badge);
       }
 
       badge.dataset.sig = item.renderSignature;
-      badge.title = item.project.name;
+      badge.dataset.projectId = item.project.id;
+      badge.title = `${item.project.name} (Click to open project)`;
 
       if (item.finalColor) {
         badge.style.setProperty('--badge-color', item.finalColor);
@@ -792,6 +798,37 @@
       logInfo(`Debug logging ${debugEnabled ? 'enabled' : 'disabled'} (reload page to update menu label)`);
     });
   }
+
+  function navigateToProject(projectId) {
+    const escapedId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(projectId) : projectId;
+    const selector = `a[href*="/g/${escapedId}"]:not([href*="/c/"])`;
+    const nativeLink = document.querySelector(`nav ${selector}, aside ${selector}, ${selector}`);
+
+    if (nativeLink) {
+      // Trigger ChatGPT's native SPA router without a full page reload
+      nativeLink.click();
+      return;
+    }
+
+    location.assign(`${location.origin}/g/${encodeURIComponent(projectId)}/project`);
+  }
+
+  // Capture-phase delegation intercepts badge clicks before the parent conversation <a> navigates
+  document.addEventListener(
+    'click',
+    (e) => {
+      const badge = e.target instanceof Element ? e.target.closest('.cgpt-project-badge') : null;
+      if (!badge) return;
+
+      const projectId = badge.dataset.projectId;
+      if (!projectId) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      navigateToProject(projectId);
+    },
+    true
+  );
 
   attachNavObserver();
 

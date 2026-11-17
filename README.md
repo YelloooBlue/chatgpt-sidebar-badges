@@ -17,6 +17,7 @@ A lightweight Tampermonkey userscript that displays **Project** badges with nati
 
 ### Features & Optimizations
 
+- **Click Badge to Open Project**: Click any project badge to jump directly to its Project page via ChatGPT's native SPA router (falls back to direct URL navigation if collapsed) without opening the underlying chat.
 - **Instant Cache-First Rendering**: Persists project metadata and conversation-to-project mappings via `GM_getValue` / `GM_setValue` (LRU capped at 400 conversations) for 0ms rendering on page load.
 - **Scoped Sidebar Observer**: Anchors `MutationObserver` strictly to the sidebar `<nav>` / `<aside>` container containing conversation links and ignores self-injected `.cgpt-project-badge` mutations, eliminating overhead during ChatGPT response streaming.
 - **Batched Read/Write DOM Updates**: Collects project visual templates and `getComputedStyle` colors once per project before mutating the DOM, preventing forced synchronous layout (layout thrashing).
@@ -48,6 +49,7 @@ Click the Tampermonkey icon in your browser toolbar to access:
 
 ### 主要特性与优化点
 
+- **点击徽章直达项目**：点击任意项目徽章即可直接跳转到对应 Project 页面（优先触发原生 SPA 路由无刷新切换，折叠时兜底 URL 跳转），不会误打开所属对话。
 - **秒级缓存渲染**：使用 `GM_getValue` / `GM_setValue` 持久化项目与会话映射（LRU 上限 400 条），刷新页面 0 延迟显示徽章。
 - **局部侧边栏监听**：`MutationObserver` 精准绑定在包含会话链接的 `<nav>` / `<aside>` 容器上，并自动忽略自身 `.cgpt-project-badge` DOM 变更，彻底消除 ChatGPT 流式输出时的卡顿。
 - **读写分离批量更新**：渲染前按项目一次性读取原生 SVG 与 `getComputedStyle` 颜色并缓存，再统一更新 DOM，避免强制重排（Layout Thrashing）。

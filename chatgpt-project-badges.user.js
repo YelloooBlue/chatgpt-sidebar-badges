@@ -1,9 +1,11 @@
 // ==UserScript==
-// @name         ChatGPT Project Badges (Pro)
+// @name         ChatGPT Project Badges
 // @namespace    chatgpt-project-badges
 // @version      2.5.0
 // @description  Show clickable Project badges with native icons & colors in ChatGPT Recent sidebar (with cache, scoped observer & 429 backoff)
 // @license      MIT
+// @homepageURL  https://github.com/YelloooBlue/chatgpt-sidebar-badges
+// @supportURL   https://github.com/YelloooBlue/chatgpt-sidebar-badges/issues
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @icon         https://chatgpt.com/favicon.ico
@@ -474,15 +476,20 @@
     logDebug(`Fetched ${totalFetched} conversations (cached: ${conversationProjects.size})`);
   }
 
-  function getSidebarProjectVisual(navRoot, projectId, visualCache) {
-    if (visualCache.has(projectId)) return visualCache.get(projectId);
-
+  function findSidebarProjectLink(projectId, navRoot = null) {
     const escapedId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(projectId) : projectId;
     // Exclude /c/ links so project conversation URLs (/g/<id>/c/<conv>) are not matched
     const selector = `a[href*="/g/${escapedId}"]:not([href*="/c/"])`;
-    const sidebarLink =
+    return (
       (navRoot && navRoot.querySelector(selector)) ||
-      document.querySelector(`nav ${selector}, aside ${selector}, ${selector}`);
+      document.querySelector(`nav ${selector}, aside ${selector}, ${selector}`)
+    );
+  }
+
+  function getSidebarProjectVisual(navRoot, projectId, visualCache) {
+    if (visualCache.has(projectId)) return visualCache.get(projectId);
+
+    const sidebarLink = findSidebarProjectLink(projectId, navRoot);
 
     let result = null;
     if (sidebarLink) {
@@ -800,9 +807,7 @@
   }
 
   function navigateToProject(projectId) {
-    const escapedId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(projectId) : projectId;
-    const selector = `a[href*="/g/${escapedId}"]:not([href*="/c/"])`;
-    const nativeLink = document.querySelector(`nav ${selector}, aside ${selector}, ${selector}`);
+    const nativeLink = findSidebarProjectLink(projectId);
 
     if (nativeLink) {
       // Trigger ChatGPT's native SPA router without a full page reload

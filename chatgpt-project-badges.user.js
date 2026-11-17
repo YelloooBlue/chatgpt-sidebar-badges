@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Project Badges (Pro)
 // @namespace    chatgpt-project-badges
-// @version      2.4.0
+// @version      2.4.1
 // @description  Show Project badges with native icons & colors in ChatGPT Recent sidebar (with cache, scoped observer & 429 backoff)
 // @license      MIT
 // @match        https://chatgpt.com/*
@@ -54,14 +54,24 @@
 
   const COLOR_PRESETS = {
     blue: '#3b82f6',
+    sky: '#0ea5e9',
+    cyan: '#06b6d4',
+    teal: '#14b8a6',
+    emerald: '#10b981',
     green: '#10b981',
+    lime: '#84cc16',
     yellow: '#eab308',
+    amber: '#f59e0b',
     orange: '#f97316',
     red: '#ef4444',
+    rose: '#f43f5e',
     pink: '#ec4899',
+    fuchsia: '#d946ef',
     purple: '#8b5cf6',
+    violet: '#8b5cf6',
     indigo: '#6366f1',
-    teal: '#14b8a6',
+    brown: '#a16207',
+    slate: '#64748b',
     gray: '#6b7280',
   };
 
@@ -202,12 +212,87 @@
 
   function normalizeColor(rawColor) {
     if (!rawColor || typeof rawColor !== 'string') return null;
-    const trimmed = rawColor.trim().toLowerCase();
-    if (COLOR_PRESETS[trimmed]) return COLOR_PRESETS[trimmed];
-    if (/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(trimmed) || trimmed.startsWith('rgb')) {
-      return rawColor.trim();
+    const trimmed = rawColor.trim();
+    const lower = trimmed.toLowerCase();
+    if (
+      !lower ||
+      lower === 'none' ||
+      lower === 'transparent' ||
+      lower === 'currentcolor' ||
+      lower === 'inherit' ||
+      lower === 'initial' ||
+      lower === 'unset'
+    ) {
+      return null;
+    }
+    if (COLOR_PRESETS[lower]) return COLOR_PRESETS[lower];
+    if (
+      /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(lower) ||
+      /^(rgba?|hsla?|oklch|oklab|color)\(/i.test(lower) ||
+      lower.startsWith('var(--')
+    ) {
+      return trimmed;
     }
     return null;
+  }
+
+  function isNonNeutralColor(cssColor) {
+    if (!cssColor) return false;
+    const rgbMatch = cssColor.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?/i);
+    if (rgbMatch) {
+      const r = Number(rgbMatch[1]);
+      const g = Number(rgbMatch[2]);
+      const b = Number(rgbMatch[3]);
+      const a = rgbMatch[4] !== undefined ? Number(rgbMatch[4]) : 1;
+      if (a === 0) return false;
+      return Math.max(r, g, b) - Math.min(r, g, b) >= 12;
+    }
+    // Non-rgb formats (hex, hsl, oklch, var) that survived normalizeColor are treated as explicit colors
+    return true;
+  }
+
+  function extractSvgColor(svg) {
+    if (!svg) return { color: null, isCustomColor: false };
+
+    const shape = svg.querySelector('path, circle, rect, polygon, polyline, line');
+    const explicitCandidates = [
+      svg.style?.color,
+      svg.getAttribute('color'),
+      svg.getAttribute('fill'),
+      svg.getAttribute('stroke'),
+      shape?.style?.color,
+      shape?.style?.fill,
+      shape?.style?.stroke,
+      shape?.getAttribute('fill'),
+      shape?.getAttribute('stroke'),
+    ];
+
+    for (const raw of explicitCandidates) {
+      const norm = normalizeColor(raw);
+      if (norm && isNonNeutralColor(norm)) {
+        return { color: norm, isCustomColor: true };
+      }
+    }
+
+    const svgStyle = getComputedStyle(svg);
+    const shapeStyle = shape ? getComputedStyle(shape) : null;
+    const computedCandidates = [
+      svgStyle.color,
+      svgStyle.fill,
+      svgStyle.stroke,
+      shapeStyle?.fill,
+      shapeStyle?.stroke,
+      shapeStyle?.color,
+    ];
+
+    for (const raw of computedCandidates) {
+      const norm = normalizeColor(raw);
+      if (norm && isNonNeutralColor(norm)) {
+        return { color: norm, isCustomColor: true };
+      }
+    }
+
+    return { color: normalizeColor(svgStyle.color), isCustomColor: false };
   }
 
   function resolveIconKey(rawIcon) {
@@ -229,7 +314,13 @@
       id,
       name: display.name || gizmo?.name || 'Project',
       color: normalizeColor(
-        display.color || display.theme_color || display.icon_color || gizmo?.color || null
+        display.color ||
+          display.theme_color ||
+          display.icon_color ||
+          display.accent_color ||
+          display.theme ||
+          gizmo?.color ||
+          null
       ),
       icon: display.icon || display.icon_name || display.emoji || null,
     };
@@ -392,17 +483,19 @@
     if (sidebarLink) {
       const svg = sidebarLink.querySelector('svg');
       let color = null;
+      let isCustomColor = false;
       let svgTemplate = null;
       if (svg) {
-        const inlineColor = svg.style.color || svg.getAttribute('color');
-        color = normalizeColor(inlineColor) || getComputedStyle(svg).color;
+        const extracted = extractSvgColor(svg);
+        color = extracted.color;
+        isCustomColor = extracted.isCustomColor;
 
         svgTemplate = svg.cloneNode(true);
         svgTemplate.removeAttribute('width');
         svgTemplate.removeAttribute('height');
         svgTemplate.setAttribute('aria-hidden', 'true');
       }
-      result = { svgTemplate, color };
+      result = { svgTemplate, color, isCustomColor };
     }
 
     visualCache.set(projectId, result);
@@ -478,7 +571,9 @@
       }
 
       const nativeVisual = getSidebarProjectVisual(navRoot, projectId, visualCache);
-      const finalColor = project.color || nativeVisual?.color || '';
+      const finalColor = nativeVisual?.isCustomColor
+        ? nativeVisual.color
+        : project.color || nativeVisual?.color || '';
       const hasNativeSvg = nativeVisual?.svgTemplate ? '1' : '0';
       const renderSignature = `${projectId}|${project.name}|${finalColor}|${project.icon || ''}|${hasNativeSvg}`;
 

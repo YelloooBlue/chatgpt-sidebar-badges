@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Project Badges (Pro)
 // @namespace    chatgpt-project-badges
-// @version      2.3.0
-// @description  Show Project badges with native icons & colors in ChatGPT Recent sidebar (with cache, smart DOM observation & 429 backoff)
+// @version      2.4.0
+// @description  Show Project badges with native icons & colors in ChatGPT Recent sidebar (with cache, scoped observer & 429 backoff)
 // @license      MIT
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -26,13 +26,13 @@
 
   const MAX_CACHED_CONVS = 400;
   const PAGE_SIZE = 28;
-  const MAX_EXTRA_CONV_PAGES = 2; // 最多额外补抓 2 页（共 84 条）以覆盖侧边栏滚动
+  const MAX_EXTRA_CONV_PAGES = 2; // Fetch up to 2 extra pages (84 chats total) for scrolled sidebars
   const SYNC_INTERVAL_MS = 90 * 1000;
   const INITIAL_DELAY_MS = 3500;
   const NEW_CHAT_SYNC_DEBOUNCE_MS = 2500;
   const MIN_SYNC_GAP_MS = 15 * 1000;
 
-  // 从本地缓存秒级恢复状态，刷新页面立即显示，不惧 429 限流
+  // Restore cached state immediately on load for instant rendering without waiting on network requests
   const projectsMap = new Map(Object.entries(GM_getValue(CACHE_KEY_PROJECTS, {})));
   const conversationProjects = new Map(Object.entries(GM_getValue(CACHE_KEY_CONVS, {})));
 
@@ -47,6 +47,10 @@
   let rafPending = false;
   let lastSyncAt = 0;
   let debouncedSyncTimer = null;
+  let navObserver = null;
+  let parentObserver = null;
+  let rootObserver = null;
+  let observedNav = null;
 
   const COLOR_PRESETS = {
     blue: '#3b82f6',
@@ -61,7 +65,7 @@
     gray: '#6b7280',
   };
 
-  // 纯几何路径数据，配合 createElementNS 构造，彻底兼容严格 CSP
+  // Pure SVG geometry definitions built via createElementNS to comply with strict CSP / TrustedHTML
   const ICON_SHAPES = {
     default: [['path', { d: 'M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z' }]],
     code: [
@@ -170,7 +174,7 @@
     const prev = conversationProjects.get(convId);
     if (gizmoId) {
       if (prev === gizmoId) {
-        // 刷新 LRU 顺序
+        // Refresh insertion order for LRU eviction
         conversationProjects.delete(convId);
         conversationProjects.set(convId, gizmoId);
         return false;
@@ -234,24 +238,24 @@
   async function getToken(forceRefresh = false) {
     if (accessToken && !forceRefresh) return accessToken;
     if (isRateLimited()) {
-      throw new Error('处于限流冷却期，跳过 Session 请求');
+      throw new Error('Rate-limit cooldown active, skipping session fetch');
     }
 
     const res = await fetch('/api/auth/session', { credentials: 'include' });
     if (res.status === 429) {
       const waitMs = setRateLimit(60 * 1000);
-      throw new Error(`Session 接口触发 429 限流，已暂停 ${Math.round(waitMs / 1000)} 秒`);
+      throw new Error(`Session endpoint hit 429, paused for ${Math.round(waitMs / 1000)}s`);
     }
-    if (!res.ok) throw new Error(`无法获取 ChatGPT 登录状态 (HTTP ${res.status})`);
+    if (!res.ok) throw new Error(`Failed to fetch ChatGPT session (HTTP ${res.status})`);
     const session = await res.json();
-    if (!session.accessToken) throw new Error('Access token 不存在');
+    if (!session.accessToken) throw new Error('Access token missing in session');
     accessToken = session.accessToken;
     return accessToken;
   }
 
   async function getJSON(url) {
     if (isRateLimited()) {
-      throw new Error('处于 429 冷却期，跳过请求');
+      throw new Error('Rate-limit cooldown active, skipping request');
     }
 
     const token = await getToken();
@@ -272,12 +276,12 @@
       const retryAfterSec = parseInt(res.headers.get('Retry-After') || '60', 10);
       const baseMs = (Number.isFinite(retryAfterSec) ? Math.max(retryAfterSec, 30) : 60) * 1000;
       const waitMs = setRateLimit(baseMs);
-      throw new Error(`HTTP 429 限流，冷却 ${Math.round(waitMs / 1000)} 秒`);
+      throw new Error(`HTTP 429 rate-limited, cooling down for ${Math.round(waitMs / 1000)}s`);
     }
 
     if (res.status === 403) {
       const waitMs = setRateLimit(60 * 1000);
-      throw new Error(`HTTP 403 拒绝访问，冷却 ${Math.round(waitMs / 1000)} 秒`);
+      throw new Error(`HTTP 403 forbidden, cooling down for ${Math.round(waitMs / 1000)}s`);
     }
 
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
@@ -312,18 +316,24 @@
       await sleep(600);
     }
 
-    // 全部页拉取成功后，同步更新并清理已删除的项目
+    // Replace cache only after all pages succeed so deleted/renamed projects are pruned
     projectsMap.clear();
     for (const [id, proj] of freshProjects) {
       projectsMap.set(id, proj);
     }
-    logDebug(`同步项目完成，共 ${projectsMap.size} 个项目`);
+    logDebug(`Synced ${projectsMap.size} projects`);
   }
 
-  function getSidebarLinks() {
-    const navLinks = document.querySelectorAll('nav a[href*="/c/"]');
-    if (navLinks.length > 0) return navLinks;
-    return document.querySelectorAll('aside a[href*="/c/"]');
+  function getSidebarNav() {
+    const link = document.querySelector(
+      'nav a[href*="/c/"], nav a[href*="/g/"], aside a[href*="/c/"], aside a[href*="/g/"]'
+    );
+    return link ? link.closest('nav, aside') : null;
+  }
+
+  function getSidebarLinks(navRoot = getSidebarNav()) {
+    if (!navRoot) return [];
+    return navRoot.querySelectorAll('a[href*="/c/"]');
   }
 
   function hasUnmappedVisibleConversations() {
@@ -365,40 +375,47 @@
       await sleep(800);
     }
 
-    logDebug(`同步会话完成，本次拉取 ${totalFetched} 条，缓存共 ${conversationProjects.size} 条`);
+    logDebug(`Fetched ${totalFetched} conversations (cached: ${conversationProjects.size})`);
   }
 
-  function getSidebarProjectVisual(projectId) {
+  function getSidebarProjectVisual(navRoot, projectId, visualCache) {
+    if (visualCache.has(projectId)) return visualCache.get(projectId);
+
     const escapedId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(projectId) : projectId;
-    // 排除包含 /c/ 的对话链接，避免误匹配到项目内的对话项
-    const selector = `nav a[href*="/g/${escapedId}"]:not([href*="/c/"]), a[href*="/g/${escapedId}"]:not([href*="/c/"])`;
-    const sidebarLink = document.querySelector(selector);
-    if (!sidebarLink) return null;
+    // Exclude /c/ links so project conversation URLs (/g/<id>/c/<conv>) are not matched
+    const selector = `a[href*="/g/${escapedId}"]:not([href*="/c/"])`;
+    const sidebarLink =
+      (navRoot && navRoot.querySelector(selector)) ||
+      document.querySelector(`nav ${selector}, aside ${selector}, ${selector}`);
 
-    const svg = sidebarLink.querySelector('svg');
-    let color = null;
-    let svgNode = null;
-    if (svg) {
-      const inlineColor = svg.style.color || svg.getAttribute('color');
-      const computedColor = getComputedStyle(svg).color;
-      color = normalizeColor(inlineColor) || computedColor;
+    let result = null;
+    if (sidebarLink) {
+      const svg = sidebarLink.querySelector('svg');
+      let color = null;
+      let svgTemplate = null;
+      if (svg) {
+        const inlineColor = svg.style.color || svg.getAttribute('color');
+        color = normalizeColor(inlineColor) || getComputedStyle(svg).color;
 
-      svgNode = svg.cloneNode(true);
-      svgNode.removeAttribute('width');
-      svgNode.removeAttribute('height');
-      svgNode.setAttribute('aria-hidden', 'true');
+        svgTemplate = svg.cloneNode(true);
+        svgTemplate.removeAttribute('width');
+        svgTemplate.removeAttribute('height');
+        svgTemplate.setAttribute('aria-hidden', 'true');
+      }
+      result = { svgTemplate, color };
     }
 
-    return { svgNode, color };
+    visualCache.set(projectId, result);
+    return result;
   }
 
-  // 使用纯 DOM API 构造图标节点，避免 innerHTML 触发 CSP / TrustedHTML 限制
+  // Build icon DOM nodes without innerHTML to satisfy CSP / TrustedHTML
   function createIconElement(nativeVisual, iconKey) {
     const wrapper = document.createElement('span');
     wrapper.className = 'cgpt-project-badge-icon';
 
-    if (nativeVisual?.svgNode) {
-      wrapper.appendChild(nativeVisual.svgNode);
+    if (nativeVisual?.svgTemplate) {
+      wrapper.appendChild(nativeVisual.svgTemplate.cloneNode(true));
       return wrapper;
     }
 
@@ -431,10 +448,14 @@
 
   function updateBadges() {
     rafPending = false;
-    const links = getSidebarLinks();
+    const navRoot = getSidebarNav();
+    const links = getSidebarLinks(navRoot);
     if (links.length === 0) return;
 
     let hasUnknownConv = false;
+    // Phase 1 (Read): collect styles and templates once per project to avoid layout thrashing
+    const visualCache = new Map();
+    const pendingUpdates = [];
 
     for (const link of links) {
       const match = link.getAttribute('href')?.match(/\/c\/([^/?#]+)/);
@@ -442,56 +463,75 @@
 
       const conversationId = match[1];
       const projectId = conversationProjects.get(conversationId);
-      let badge = link.querySelector('.cgpt-project-badge');
+      const badge = link.querySelector('.cgpt-project-badge');
 
       if (!projectId) {
         hasUnknownConv = true;
-        if (badge) badge.remove();
+        if (badge) pendingUpdates.push({ type: 'remove', badge });
         continue;
       }
 
       const project = projectsMap.get(projectId);
       if (!project) {
-        if (badge) badge.remove();
+        if (badge) pendingUpdates.push({ type: 'remove', badge });
         continue;
       }
 
-      const nativeVisual = getSidebarProjectVisual(projectId);
+      const nativeVisual = getSidebarProjectVisual(navRoot, projectId, visualCache);
       const finalColor = project.color || nativeVisual?.color || '';
-      const hasNativeSvg = nativeVisual?.svgNode ? '1' : '0';
+      const hasNativeSvg = nativeVisual?.svgTemplate ? '1' : '0';
       const renderSignature = `${projectId}|${project.name}|${finalColor}|${project.icon || ''}|${hasNativeSvg}`;
 
       if (badge && badge.dataset.sig === renderSignature) {
         continue;
       }
 
+      pendingUpdates.push({
+        type: 'upsert',
+        link,
+        badge,
+        project,
+        nativeVisual,
+        finalColor,
+        renderSignature,
+      });
+    }
+
+    // Phase 2 (Write): apply all DOM mutations in a single batch
+    for (const item of pendingUpdates) {
+      if (item.type === 'remove') {
+        item.badge.remove();
+        continue;
+      }
+
+      let badge = item.badge;
       if (!badge) {
         badge = document.createElement('span');
         badge.className = 'cgpt-project-badge';
         badge.setAttribute('aria-hidden', 'true');
-        link.appendChild(badge);
+        item.link.appendChild(badge);
       }
 
-      badge.dataset.sig = renderSignature;
-      badge.title = project.name;
+      badge.dataset.sig = item.renderSignature;
+      badge.title = item.project.name;
 
-      if (finalColor) {
-        badge.style.setProperty('--badge-color', finalColor);
+      if (item.finalColor) {
+        badge.style.setProperty('--badge-color', item.finalColor);
       } else {
         badge.style.removeProperty('--badge-color');
       }
 
       const textNode = document.createElement('span');
       textNode.className = 'cgpt-project-badge-text';
-      textNode.textContent = project.name;
+      textNode.textContent = item.project.name;
 
       badge.replaceChildren(
-        createIconElement(nativeVisual, project.icon),
+        createIconElement(item.nativeVisual, item.project.icon),
         textNode
       );
     }
 
-    // 发现新出现的未映射会话（如新建或刚移入项目的对话）时，温和触发一次防抖同步
+    // Trigger a debounced sync when newly created or moved conversations appear in the sidebar
     if (hasUnknownConv && !scanning && !isRateLimited() && Date.now() - lastSyncAt > MIN_SYNC_GAP_MS) {
       scheduleDebouncedSync();
     }
@@ -516,7 +556,7 @@
     if (!force && document.hidden) return;
     if (isRateLimited()) {
       const remainSec = Math.ceil((rateLimitState.until - Date.now()) / 1000);
-      logDebug(`处于 429 冷却期，剩余 ${remainSec} 秒`);
+      logDebug(`Rate-limit cooldown active (${remainSec}s remaining)`);
       return;
     }
 
@@ -536,74 +576,129 @@
     }
   }
 
-  function isSidebarRelevantMutation(mutations) {
+  function isSelfBadgeMutation(mutations) {
     for (const m of mutations) {
-      const target = m.target;
-      if (target instanceof Element) {
-        if (target.closest('nav, aside')) return true;
+      if (m.target instanceof Element && m.target.closest('.cgpt-project-badge')) {
+        continue;
       }
-      for (const node of m.addedNodes) {
-        if (!(node instanceof Element)) continue;
-        if (
-          node.matches('nav, aside, a[href*="/c/"], a[href*="/g/"]') ||
-          node.querySelector('nav, aside, a[href*="/c/"], a[href*="/g/"]')
-        ) {
-          return true;
+      let onlySelfBadges = true;
+      for (const n of m.addedNodes) {
+        if (!(n instanceof Element) || !n.classList.contains('cgpt-project-badge')) {
+          onlySelfBadges = false;
+          break;
         }
       }
+      if (!onlySelfBadges) return false;
+      for (const n of m.removedNodes) {
+        if (!(n instanceof Element) || !n.classList.contains('cgpt-project-badge')) {
+          onlySelfBadges = false;
+          break;
+        }
+      }
+      if (!onlySelfBadges) return false;
     }
-    return false;
+    return true;
+  }
+
+  function watchForNavMount() {
+    if (!document.body || rootObserver) return;
+    rootObserver = new MutationObserver(() => {
+      const nav = getSidebarNav();
+      if (nav) {
+        rootObserver.disconnect();
+        rootObserver = null;
+        attachNavObserver();
+      }
+    });
+    rootObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  // Scope MutationObserver to the sidebar nav container to avoid overhead during chat streaming
+  function attachNavObserver() {
+    const nav = getSidebarNav();
+    if (!nav) {
+      watchForNavMount();
+      return;
+    }
+    if (nav === observedNav && nav.isConnected) return;
+
+    if (navObserver) navObserver.disconnect();
+    if (parentObserver) parentObserver.disconnect();
+    observedNav = nav;
+
+    navObserver = new MutationObserver((mutations) => {
+      if (!isSelfBadgeMutation(mutations)) {
+        scheduleUpdateBadges();
+      }
+    });
+
+    navObserver.observe(nav, {
+      childList: true,
+      subtree: true,
+    });
+
+    if (nav.parentElement) {
+      parentObserver = new MutationObserver(() => {
+        if (!observedNav || !observedNav.isConnected) {
+          observedNav = null;
+          if (navObserver) navObserver.disconnect();
+          if (parentObserver) parentObserver.disconnect();
+          attachNavObserver();
+        }
+      });
+      parentObserver.observe(nav.parentElement, {
+        childList: true,
+        subtree: false,
+      });
+    }
+
+    logDebug('Attached scoped MutationObserver to sidebar nav');
+    scheduleUpdateBadges();
   }
 
   function registerMenuCommands() {
     if (typeof GM_registerMenuCommand !== 'function') return;
 
-    GM_registerMenuCommand('🔄 立即同步项目与会话', () => {
-      logInfo('手动触发同步...');
+    GM_registerMenuCommand('Sync Projects & Conversations Now', () => {
+      logInfo('Manual sync triggered');
       scan(true);
     });
 
-    GM_registerMenuCommand('📊 查看当前状态', () => {
+    GM_registerMenuCommand('Show Cache & Rate-Limit Status', () => {
       const remainSec = isRateLimited()
         ? Math.ceil((rateLimitState.until - Date.now()) / 1000)
         : 0;
       const statusMsg = [
-        `已缓存项目: ${projectsMap.size}`,
-        `已缓存会话映射: ${conversationProjects.size}`,
-        `429 冷却剩余: ${remainSec}s`,
-        `调试日志: ${debugEnabled ? '开启' : '关闭'}`,
+        `Cached projects: ${projectsMap.size}`,
+        `Cached conversations: ${conversationProjects.size}`,
+        `429 cooldown remaining: ${remainSec}s`,
+        `Debug logging: ${debugEnabled ? 'ON' : 'OFF'}`,
       ].join('\n');
       logInfo(statusMsg.replace(/\n/g, ' | '));
       alert(`[ChatGPT Project Badges]\n${statusMsg}`);
     });
 
-    GM_registerMenuCommand('🗑️ 清除本地缓存', () => {
+    GM_registerMenuCommand('Clear Local Cache', () => {
       projectsMap.clear();
       conversationProjects.clear();
       resetRateLimit();
       saveCaches();
       scheduleUpdateBadges();
-      logInfo('本地缓存已清除，准备重新同步...');
+      logInfo('Local cache cleared, resyncing...');
       scan(true);
     });
 
-    GM_registerMenuCommand(`🐛 ${debugEnabled ? '关闭' : '开启'}调试日志`, () => {
+    GM_registerMenuCommand(`Toggle Debug Logging (${debugEnabled ? 'ON' : 'OFF'})`, () => {
       debugEnabled = !debugEnabled;
       GM_setValue(CACHE_KEY_DEBUG, debugEnabled);
-      logInfo(`调试日志已${debugEnabled ? '开启' : '关闭'}（刷新页面生效菜单文案）`);
+      logInfo(`Debug logging ${debugEnabled ? 'enabled' : 'disabled'} (reload page to update menu label)`);
     });
   }
 
-  const observer = new MutationObserver((mutations) => {
-    if (isSidebarRelevantMutation(mutations)) {
-      scheduleUpdateBadges();
-    }
-  });
-
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-  });
+  attachNavObserver();
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
@@ -616,12 +711,12 @@
 
   registerMenuCommands();
 
-  // 1. 立即用本地缓存渲染一次（0 延迟、0 请求）
+  // 1. Render immediately from local cache (0ms delay, 0 requests)
   scheduleUpdateBadges();
 
-  // 2. 延迟 3.5 秒错峰执行首次后台同步，避开页面加载时的接口拥堵
+  // 2. Stagger initial background sync to avoid page-load API congestion
   setTimeout(() => scan(), INITIAL_DELAY_MS);
 
-  // 3. 每 90 秒低频同步一次
+  // 3. Low-frequency background sync every 90s
   setInterval(() => scan(), SYNC_INTERVAL_MS);
 })();
